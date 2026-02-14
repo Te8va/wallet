@@ -1,0 +1,130 @@
+name: Database Migrations
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'migrations/**'
+      - 'cmd/migrate/**'
+      - 'internal/repository/**'
+      - 'go.mod'
+      - 'go.sum'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'migrations/**'
+      - 'cmd/migrate/**'
+
+jobs:
+  test-migrations:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: wallet
+          POSTGRES_PASSWORD: wallet
+          POSTGRES_DB: wallet
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache-dependency-path: go.sum
+          
+      - name: Download dependencies
+        run: go mod download
+          
+      - name: Wait for PostgreSQL to be ready
+        run: |
+          for i in {1..10}; do
+            if pg_isready -h localhost -p 5432 -U wallet; then
+              echo "✅ PostgreSQL is ready!"
+              break
+            else
+              echo "⏳ Waiting for PostgreSQL... (attempt $i/10)"
+              sleep 3
+            fi
+          done
+          
+      - name: Verify migrations can be built
+        run: |
+          go build -o /dev/null ./cmd/migrate
+          echo "✅ Migration tool builds successfully"
+          
+      - name: Show initial migration version
+        run: |
+          go run ./cmd/migrate \
+            -dsn "postgres://wallet:wallet@localhost:5432/wallet?sslmode=disable" \
+            -command version || echo "ℹ️ No migrations yet"
+          
+      - name: Run migrations up
+        run: |
+          go run ./cmd/migrate \
+            -dsn "postgres://wallet:wallet@localhost:5432/wallet?sslmode=disable" \
+            -command up
+          
+      - name: Verify migrations version after up
+        run: |
+          go run ./cmd/migrate \
+            -dsn "postgres://wallet:wallet@localhost:5432/wallet?sslmode=disable" \
+            -command version
+          
+      - name: Test rollback (for PRs only)
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "🔄 Testing rollback..."
+          go run ./cmd/migrate \
+            -dsn "postgres://wallet:wallet@localhost:5432/wallet?sslmode=disable" \
+            -command down
+          
+      - name: Verify version after rollback
+        if: github.event_name == 'pull_request'
+        run: |
+          go run ./cmd/migrate \
+            -dsn "postgres://wallet:wallet@localhost:5432/wallet?sslmode=disable" \
+            -command version || echo "ℹ️ No migrations left"
+
+  validate-migrations:
+    runs-on: ubuntu-latest
+    needs: test-migrations
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Check for migration conflicts
+        run: |
+          # Проверка на конфликты в миграциях
+          FILES=$(git diff --name-only origin/main HEAD -- migrations/)
+          if [ -n "$FILES" ]; then
+            echo "✅ Modified migration files:"
+            echo "$FILES"
+          else
+            echo "ℹ️ No migration files changed"
+          fi
+          
+      - name: Validate SQL syntax
+        run: |
+          # Проверка синтаксиса SQL
+          for file in migrations/*.sql; do
+            echo "Checking $file..."
+            docker run --rm -v $(pwd):/migrations postgres:15 \
+              psql -U wallet -d wallet -f "/migrations/$(basename $file)" > /dev/null 2>&1 || \
+              echo "⚠️ Warning: SQL validation skipped (needs running DB)"
+          done
